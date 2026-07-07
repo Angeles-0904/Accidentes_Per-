@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Entornos virtuales
+venv/
+.venv/
+env/
+
+# Modelos grandes (se regeneran)
+outputs/models/*.pkl
+
+# Datos crudos (son grandes)
+data/raw/
+data/external/
+
+# Archivos CSV en la raiz (datos raw)
+*.csv
+
+# Incluir datos procesados (necesarios para la app)
+!data/processed/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# Notebooks (grandes)
+notebooks/.ipynb_checkpoints/
