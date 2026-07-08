@@ -10,15 +10,22 @@ venv/
 .venv/
 env/
 
-# Modelos grandes (se regeneran)
+# Modelos grandes (se regeneran) - excepto los necesarios para deploy
 outputs/models/*.pkl
+!outputs/models/modelo_logistic_regression.pkl
+!outputs/models/scaler.pkl
 
 # Datos crudos (son grandes)
 data/raw/
-data/external/
 
-# Archivos CSV en la raiz (datos raw)
+# Datos externos (excepto GeoJSON necesario para el mapa)
+data/external/
+!data/external/peru_departamentos.geojson
+
+# Archivos CSV en todo el proyecto
 *.csv
+!data/processed/*.csv
+!outputs/tables/*.csv
 
 # Incluir datos procesados (necesarios para la app)
 !data/processed/
@@ -32,6 +39,7 @@ data/external/
 # OS
 Thumbs.db
 .DS_Store
+~$*.docx
 
 # Streamlit
 .streamlit/

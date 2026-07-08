@@ -1,0 +1,65 @@
+================================================================
+REPORTE ESTADISTICO - PROYECTO DE INVESTIGACION
+Modelado Predictivo de Severidad de Siniestros Viales Fatales
+Peru - ONSV 2021-2025
+================================================================
+
+1. ESTADISTICA DESCRIPTIVA
+--------------------------
+Total de siniestros analizados: 9107 
+
+Distribucion de Severidad:
+   Baja : 8177 (89.8%) 
+   Media : 616 (6.8%) 
+   Alta : 314 (3.4%) 
+
+2. PRUEBAS DE HIPOTESIS
+-----------------------
+
+1. Chi-cuadrado: ZONA vs SEVERIDAD
+  Estadistico: 355.3027 
+  p-valor: 1.256019e-75 
+  Significativo: Si (p<0.05) 
+  Conclusion: Existe relacion significativa entre ZONA y SEVERIDAD 
+
+2. Chi-cuadrado: CONDICION_CLIMATICA vs SEVERIDAD
+  Estadistico: 99.3161 
+  p-valor: 4.997501e-04 
+  Significativo: Si (p<0.05) 
+  Conclusion: Existe relacion significativa entre CONDICION CLIMATICA y SEVERIDAD 
+
+3. Chi-cuadrado: CAUSA_FACTOR_PRINCIPAL vs SEVERIDAD
+  Estadistico: 135.6741 
+  p-valor: 4.997501e-04 
+  Significativo: Si (p<0.05) 
+  Conclusion: Existe relacion significativa entre CAUSA y SEVERIDAD 
+
+4. Chi-cuadrado: FRANJA_HORARIA vs SEVERIDAD
+  Estadistico: 26.8529 
+  p-valor: 4.997501e-04 
+  Significativo: Si (p<0.05) 
+  Conclusion: Existe relacion significativa entre FRANJA HORARIA y SEVERIDAD 
+
+5. ANOVA: EDAD_PROMEDIO vs SEVERIDAD
+  Estadistico: 5.7568 
+  p-valor: 3.172599e-03 
+  Significativo: Si (p<0.05) 
+  Conclusion: Existen diferencias significativas en edad promedio entre niveles de severidad 
+
+6. ANOVA: RIESGO_INFRAESTRUCTURA vs SEVERIDAD
+  Estadistico: 3.1253 
+  p-valor: 4.397148e-02 
+  Significativo: Si (p<0.05) 
+  Conclusion: Existen diferencias significativas en riesgo de infraestructura entre niveles de severidad 
+
+3. CONCLUSIONES ESTADISTICAS
+---------------------------
+1. La mayoria de siniestros (89.8%) presentan severidad baja (1 fallecido).
+2. El analisis de varianza (ANOVA) evalua diferencias de edad y riesgo segun severidad.
+3. Las pruebas chi-cuadrado revelan la asociacion entre factores de riesgo y severidad.
+4. Se recomienda usar modelos de clasificacion con balanceo de clases.
+5. R se utilizo para estadistica descriptiva, inferencial y visualizaciones profesionales.
+
+================================================================
+Fin del reporte estadistico
+================================================================

@@ -17,6 +17,7 @@ import joblib
 from pathlib import Path
 from PIL import Image
 import base64
+import json
 from io import BytesIO
 
 # ─── Configuracion de pagina ─────────────────────────────────
@@ -33,6 +34,7 @@ DATA_PROCESSED = BASE_DIR / "data" / "processed"
 FIGURES = BASE_DIR / "outputs" / "figures"
 MODELS_DIR = BASE_DIR / "outputs" / "models"
 TABLES = BASE_DIR / "outputs" / "tables"
+REPORTS = BASE_DIR / "outputs" / "reports"
 
 # ─── Cargar datos ─────────────────────────────────────────────
 @st.cache_data
@@ -58,9 +60,44 @@ def load_comparison():
         return pd.read_csv(csv_path)
     return None
 
+@st.cache_data
+def load_r_results():
+    """Cargar resultados de R (pruebas estadisticas)"""
+    csv_path = TABLES / 'resultados_r.csv'
+    if csv_path.exists():
+        return pd.read_csv(csv_path)
+    return None
+
+@st.cache_data
+def load_r_severidad():
+    csv_path = TABLES / 'r_severidad_distribucion.csv'
+    if csv_path.exists():
+        return pd.read_csv(csv_path)
+    return None
+
+@st.cache_resource
+def load_geojson():
+    """Cargar GeoJSON de departamentos del Peru."""
+    geojson_path = BASE_DIR / "data" / "external" / "peru_departamentos.geojson"
+    if geojson_path.exists():
+        with open(geojson_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+@st.cache_data
+def load_r_dptos():
+    csv_path = TABLES / 'r_top_departamentos.csv'
+    if csv_path.exists():
+        return pd.read_csv(csv_path)
+    return None
+
 df = load_data()
 model, scaler = load_model()
 df_cmp = load_comparison()
+df_r = load_r_results()
+df_r_sev = load_r_severidad()
+df_r_dptos = load_r_dptos()
+geojson_peru = load_geojson()
 
 # ─── Sidebar ──────────────────────────────────────────────────
 st.sidebar.markdown("""
@@ -77,21 +114,96 @@ pagina = st.sidebar.radio(
     "Navegacion",
     ["Inicio", "Resumen Nacional", "Mapa", "Analisis Temporal",
      "Perfil de Personas", "Factores de Riesgo",
+     "Dashboard Ejecutivo",
+     "Analisis Estadistico (R)",
      "Modelos Predictivos", "Prediccion Individual", "Conclusiones"]
 )
 
+# ─── FILTROS INTERACTIVOS ────────────────────────────────────
 st.sidebar.markdown("---")
+st.sidebar.markdown("### 🔍 Filtros")
+
+# Estado de los filtros en session_state para persistencia
+if "filtro_departamento" not in st.session_state:
+    st.session_state.filtro_departamento = []
+if "filtro_anio" not in st.session_state:
+    st.session_state.filtro_anio = []
+
+# Obtener opciones
+anios_disponibles = sorted(df['ANIO'].dropna().unique().astype(int).tolist())
+dptos_disponibles = sorted(df['DEPARTAMENTO'].dropna().unique().tolist())
+
+# Filtros
+filtro_dpto = st.sidebar.multiselect(
+    "Departamento",
+    options=dptos_disponibles,
+    default=st.session_state.filtro_departamento,
+    placeholder="Todos los departamentos",
+    help="Filtrar por uno o mas departamentos"
+)
+
+filtro_anio = st.sidebar.multiselect(
+    "Anio",
+    options=anios_disponibles,
+    default=st.session_state.filtro_anio,
+    placeholder="Todos los anios",
+    help="Filtrar por uno o mas anios"
+)
+
+filtro_zona = st.sidebar.radio(
+    "Zona",
+    options=["Todas", "URBANA", "RURAL"],
+    horizontal=True,
+    help="Filtrar por zona geografica"
+)
+
+filtro_severidad = st.sidebar.radio(
+    "Severidad",
+    options=["Todas", "Baja", "Media", "Alta"],
+    horizontal=True,
+    help="Filtrar por nivel de severidad"
+)
+
+# ─── APLICAR FILTROS ──────────────────────────────────────────
+@st.cache_data
+def get_filtered_data(df_orig, dptos, anios, zona, severidad):
+    """Aplicar filtros al dataframe y retornar version filtrada."""
+    df_filt = df_orig.copy()
+
+    if dptos:
+        df_filt = df_filt[df_filt['DEPARTAMENTO'].isin(dptos)]
+    if anios:
+        df_filt = df_filt[df_filt['ANIO'].isin(anios)]
+    if zona != "Todas":
+        df_filt = df_filt[df_filt['ZONA'] == zona]
+    if severidad != "Todas":
+        severidad_map = {"Baja": 0, "Media": 1, "Alta": 2}
+        df_filt = df_filt[df_filt['severidad'] == severidad_map[severidad]]
+
+    return df_filt
+
+df_filtrado = get_filtered_data(df, filtro_dpto, filtro_anio, filtro_zona, filtro_severidad)
+
+# Guardar estado actual para persistencia
+if filtro_dpto:
+    st.session_state.filtro_departamento = filtro_dpto
+if filtro_anio:
+    st.session_state.filtro_anio = filtro_anio
+
 st.sidebar.markdown(f"""
 **Datos cargados:**
 - {len(df):,} siniestros
 - {df['CANTIDAD_FALLECIDOS'].sum():,} fallecidos
-- {df['CANTIDAD_LESIONADOS'].sum():,} lesionados
 """)
+
+# Badge de filtro activo
+if len(df_filtrado) < len(df):
+    st.sidebar.info(f"🎯 Mostrando **{len(df_filtrado):,}** de **{len(df):,}** siniestros")
 
 st.sidebar.markdown("---")
 st.sidebar.info(
     "Proyecto Final - Ingenieria de Sistemas\n"
-    "Universidad Nacional del Altiplano"
+    "Universidad Nacional del Altiplano - Puno"
 )
 
 # ─── FUNCIONES COMUNES ────────────────────────────────────────
@@ -102,21 +214,90 @@ def img_to_base64(path):
     except:
         return None
 
-def mostrar_metricas():
+def mostrar_metricas(df_mostrar=None):
+    """Mostrar KPIs basicos. Usa df_filtrado si no se especifica df_mostrar."""
+    if df_mostrar is None:
+        df_mostrar = df_filtrado
     col1, col2, col3, col4 = st.columns(4)
     with col1:
-        st.metric("Total Siniestros", f"{len(df):,}",
+        st.metric("Total Siniestros", f"{len(df_mostrar):,}",
                   help="Numero total de siniestros fatales registrados")
     with col2:
-        st.metric("Total Fallecidos", f"{df['CANTIDAD_FALLECIDOS'].sum():,}",
+        st.metric("Total Fallecidos", f"{df_mostrar['CANTIDAD_FALLECIDOS'].sum():,}",
                   help="Numero total de victimas fatales")
     with col3:
-        st.metric("Total Lesionados", f"{df['CANTIDAD_LESIONADOS'].sum():,}",
+        st.metric("Total Lesionados", f"{df_mostrar['CANTIDAD_LESIONADOS'].sum():,}",
                   help="Numero total de personas lesionadas")
     with col4:
-        promedio = df['CANTIDAD_FALLECIDOS'].mean()
+        promedio = df_mostrar['CANTIDAD_FALLECIDOS'].mean()
         st.metric("Prom. Fallecidos/Siniestro", f"{promedio:.2f}",
                   help="Promedio de fallecidos por siniestro")
+
+def mostrar_kpis_ejecutivos(df_mostrar):
+    """KPIs ejecutivos para un gerente del ONSV."""
+    col1, col2, col3, col4 = st.columns(4)
+
+    # KPI 1: Tasa de mortalidad (fallecidos por siniestro)
+    tasa = df_mostrar['CANTIDAD_FALLECIDOS'].sum() / len(df_mostrar) if len(df_mostrar) > 0 else 0
+    col1.markdown("""
+    <div style="background:#1a5276; padding:15px; border-radius:10px; text-align:center;">
+        <p style="color:#85c1e9; font-size:12px; margin:0;">🚨 TASA MORTALIDAD</p>
+        <p style="color:white; font-size:28px; font-weight:bold; margin:5px 0;">{:.2f}</p>
+        <p style="color:#85c1e9; font-size:11px; margin:0;">fallecidos / siniestro</p>
+    </div>
+    """.format(tasa), unsafe_allow_html=True)
+
+    # KPI 2: % Severidad Alta
+    pct_alta = (df_mostrar['severidad'] == 2).sum() / len(df_mostrar) * 100 if len(df_mostrar) > 0 else 0
+    col2.markdown("""
+    <div style="background:#922b21; padding:15px; border-radius:10px; text-align:center;">
+        <p style="color:#f1948a; font-size:12px; margin:0;">⚠️ SEVERIDAD ALTA</p>
+        <p style="color:white; font-size:28px; font-weight:bold; margin:5px 0;">{:.1f}%</p>
+        <p style="color:#f1948a; font-size:11px; margin:0;">3+ fallecidos</p>
+    </div>
+    """.format(pct_alta), unsafe_allow_html=True)
+
+    # KPI 3: Departamento mas critico
+    dpto_critico = df_mostrar.groupby('DEPARTAMENTO').agg(
+        Total=('severidad', 'count')
+    ).sort_values('Total', ascending=False).head(1)
+    nom_dpto = dpto_critico.index[0] if len(dpto_critico) > 0 else "-"
+    val_dpto = int(dpto_critico['Total'].iloc[0]) if len(dpto_critico) > 0 else 0
+    col3.markdown("""
+    <div style="background:#1e8449; padding:15px; border-radius:10px; text-align:center;">
+        <p style="color:#82e0aa; font-size:12px; margin:0;">📍 DPTO MAS CRITICO</p>
+        <p style="color:white; font-size:22px; font-weight:bold; margin:5px 0;">{}</p>
+        <p style="color:#82e0aa; font-size:11px; margin:0;">{} siniestros</p>
+    </div>
+    """.format(nom_dpto, val_dpto), unsafe_allow_html=True)
+
+    # KPI 4: Franja horaria mas peligrosa
+    franja_map_kpi = {0: 'Madrugada', 1: 'Maniana', 2: 'Tarde', 3: 'Noche'}
+    franja_critica = df_mostrar['FRANJA_HORARIA'].value_counts().head(1)
+    nom_franja = franja_map_kpi.get(franja_critica.index[0], '-') if len(franja_critica) > 0 else "-"
+    val_franja = int(franja_critica.iloc[0]) if len(franja_critica) > 0 else 0
+    col4.markdown("""
+    <div style="background:#7d3c98; padding:15px; border-radius:10px; text-align:center;">
+        <p style="color:#d2b4de; font-size:12px; margin:0;">🕐 FRANJA PELIGROSA</p>
+        <p style="color:white; font-size:22px; font-weight:bold; margin:5px 0;">{}</p>
+        <p style="color:#d2b4de; font-size:11px; margin:0;">{} siniestros</p>
+    </div>
+    """.format(nom_franja, val_franja), unsafe_allow_html=True)
+
+    with st.expander("📋 Ver todos los indicadores ejecutivos"):
+        col_a, col_b, col_c, col_d = st.columns(4)
+        with col_a:
+            st.metric("Vehiculos involucrados", f"{df_mostrar['CANTIDAD_VEHICULOS'].sum():,}")
+            st.metric("Tasa lesionados/siniestro", f"{df_mostrar['CANTIDAD_LESIONADOS'].mean():.2f}")
+        with col_b:
+            st.metric("% Zona Rural", f"{(df_mostrar['ZONA']=='RURAL').sum()/len(df_mostrar)*100:.1f}%")
+            st.metric("% Zona Urbana", f"{(df_mostrar['ZONA']=='URBANA').sum()/len(df_mostrar)*100:.1f}%")
+        with col_c:
+            st.metric("Edad promedio", f"{df_mostrar['EDAD_PROMEDIO'].mean():.1f} anios")
+            st.metric("% Alcohol positivo", f"{df_mostrar['PCT_ALCOHOL'].mean()*100:.1f}%")
+        with col_d:
+            st.metric("Domingos (mayor incidencia)", f"{(df_mostrar['DIA_SEMANA']==6).sum():,}")
+            st.metric("% Fin de semana", f"{df_mostrar['FIN_SEMANA'].mean()*100:.1f}%")
 
 # ─── PAGINA 1: INICIO ─────────────────────────────────────────
 if pagina == "Inicio":
@@ -153,7 +334,7 @@ if pagina == "Inicio":
         - Escuela Profesional de Ingenieria de Sistemas
         """)
 
-    mostrar_metricas()
+    mostrar_metricas(df)
 
     st.markdown("---")
     st.markdown("""
@@ -173,12 +354,16 @@ elif pagina == "Resumen Nacional":
     st.title("📊 Resumen Nacional")
     st.markdown("---")
 
-    mostrar_metricas()
+    # KPIs Ejecutivos
+    mostrar_kpis_ejecutivos(df_filtrado)
+
+    st.markdown("---")
+    mostrar_metricas(df_filtrado)
 
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Distribucion de Severidad")
-        fig = px.pie(df, names='SEVERIDAD_LABEL',
+        fig = px.pie(df_filtrado, names='SEVERIDAD_LABEL',
                      title='Proporcion por Nivel de Severidad',
                      color='SEVERIDAD_LABEL',
                      color_discrete_map={
@@ -190,21 +375,21 @@ elif pagina == "Resumen Nacional":
 
     with col2:
         st.subheader("Severidad por Departamento (Top 10)")
-        dpto_sev = df.groupby('DEPARTAMENTO').agg(
+        dpto_sev = df_filtrado.groupby('DEPARTAMENTO').agg(
             Total=('severidad', 'count'),
             Promedio=('severidad', 'mean')
         ).sort_values('Total', ascending=False).head(10)
 
         fig = px.bar(dpto_sev, x=dpto_sev.index, y='Total',
                      color='Promedio', color_continuous_scale='RdYlGn_r',
-                     title='Top 10 Departamentos con Mas Siniestros')
+                     title='Top 10 Departamentos')
         fig.update_xaxes(tickangle=45)
         st.plotly_chart(fig, use_container_width=True)
 
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Siniestros por Zona")
-        zona_counts = df['ZONA'].value_counts()
+        zona_counts = df_filtrado['ZONA'].value_counts()
         fig = px.bar(zona_counts, x=zona_counts.index, y=zona_counts.values,
                      color=zona_counts.index,
                      title='Distribucion Urbano/Rural',
@@ -213,27 +398,55 @@ elif pagina == "Resumen Nacional":
 
     with col2:
         st.subheader("Top 10 Causas Principales")
-        causa_counts = df['CAUSA_FACTOR_PRINCIPAL'].value_counts().head(10)
+        causa_counts = df_filtrado['CAUSA_FACTOR_PRINCIPAL'].value_counts().head(10)
         fig = px.bar(causa_counts, x=causa_counts.values, y=causa_counts.index,
                      orientation='h', title='Causas mas Frecuentes',
                      color=causa_counts.values, color_continuous_scale='Oranges')
         st.plotly_chart(fig, use_container_width=True)
+
+    # Boton de descarga datos filtrados
+    csv_filtrado = df_filtrado.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        "📥 Descargar datos filtrados (CSV)",
+        data=csv_filtrado,
+        file_name="siniestros_filtrados.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # Insight automatizado
+    with st.expander("📌 Ver analisis del periodo seleccionado"):
+        total_s = len(df_filtrado)
+        total_f = df_filtrado['CANTIDAD_FALLECIDOS'].sum()
+        pct_rural = (df_filtrado['ZONA'] == 'RURAL').mean() * 100
+        top_causa = df_filtrado['CAUSA_FACTOR_PRINCIPAL'].value_counts().index[0] if total_s > 0 else "-"
+        prom_edad = df_filtrado['EDAD_PROMEDIO'].mean()
+
+        st.markdown(f"""
+        **Insight del periodo filtrado:**
+        - Se analizaron **{total_s:,} siniestros** con **{total_f:,} fallecidos**.
+        - El **{pct_rural:.1f}%** ocurrio en zona rural (donde la severidad suele ser mayor).
+        - La causa principal es: **{top_causa}**.
+        - La edad promedio de involucrados es **{prom_edad:.1f} anios**.
+        """)
 
 # ─── PAGINA 3: MAPA ──────────────────────────────────────────
 elif pagina == "Mapa":
     st.title("🗺️ Distribucion Geografica")
     st.markdown("---")
 
-    df_map = df.dropna(subset=['LATITUD', 'LONGITUD']).copy()
+    mostrar_metricas(df_filtrado)
+
+    df_map = df_filtrado.dropna(subset=['LATITUD', 'LONGITUD']).copy()
     df_map = df_map[
         (df_map['LATITUD'].between(-20, 0)) &
         (df_map['LONGITUD'].between(-85, -68))
     ]
 
     st.subheader("Mapa de Siniestros Fatales")
-
+    n_muestra = min(3000, len(df_map))
     fig = px.scatter_mapbox(
-        df_map.sample(min(3000, len(df_map))),
+        df_map.sample(n_muestra) if n_muestra > 0 else df_map,
         lat='LATITUD', lon='LONGITUD',
         color='SEVERIDAD_LABEL',
         size='CANTIDAD_FALLECIDOS',
@@ -251,13 +464,13 @@ elif pagina == "Mapa":
         },
         zoom=4.5, center={"lat": -9.5, "lon": -75},
         mapbox_style='open-street-map',
-        title='Distribucion Geografica de Siniestros Fatales (muestra de 3000)'
+        title=f'Distribucion Geografica ({n_muestra} puntos mostrados)'
     )
     fig.update_layout(height=600)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Top 10 Departamentos")
-    dpto_stats = df.groupby('DEPARTAMENTO').agg(
+    st.subheader("Estadisticas por Departamento")
+    dpto_stats = df_filtrado.groupby('DEPARTAMENTO').agg(
         Siniestros=('CODIGO_SINIESTRO', 'count'),
         Fallecidos=('CANTIDAD_FALLECIDOS', 'sum'),
         Lesionados=('CANTIDAD_LESIONADOS', 'sum'),
@@ -271,12 +484,24 @@ elif pagina == "Mapa":
         'Lesionados': '{:,.0f}'
     }), use_container_width=True)
 
+    # Boton de descarga
+    csv_data = dpto_stats.to_csv().encode('utf-8-sig')
+    st.download_button(
+        "📥 Descargar datos de departamentos (CSV)",
+        data=csv_data,
+        file_name="departamentos_filtrados.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
 # ─── PAGINA 4: ANALISIS TEMPORAL ─────────────────────────────
 elif pagina == "Analisis Temporal":
     st.title("📈 Analisis Temporal")
     st.markdown("---")
 
-    df_temp = df.dropna(subset=['FECHA_SINIESTRO']).copy()
+    mostrar_metricas(df_filtrado)
+
+    df_temp = df_filtrado.dropna(subset=['FECHA_SINIESTRO']).copy()
     df_temp['ANIO'] = df_temp['FECHA_SINIESTRO'].dt.year
     df_temp['MES'] = df_temp['FECHA_SINIESTRO'].dt.month
     df_temp['ANIO_MES'] = df_temp['FECHA_SINIESTRO'].dt.to_period('M').astype(str)
@@ -323,6 +548,16 @@ elif pagina == "Analisis Temporal":
                   markers=True)
     fig.update_xaxes(tickangle=45, nticks=20)
     st.plotly_chart(fig, use_container_width=True)
+
+    # Descarga de serie temporal
+    csv_temporal = serie_mensual.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        "📥 Descargar serie temporal (CSV)",
+        data=csv_temporal,
+        file_name="serie_temporal_mensual.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
 
 # ─── PAGINA 5: PERFIL DE PERSONAS ────────────────────────────
 elif pagina == "Perfil de Personas":
@@ -408,15 +643,28 @@ elif pagina == "Perfil de Personas":
     else:
         st.warning("Datos de personas no disponibles. Ejecute primero 01_clean_datasets.py")
 
+    # Descarga
+    if personas_path.exists():
+        csv_personas = df_per.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            "📥 Descargar datos de personas (CSV)",
+            data=csv_personas,
+            file_name="personas_involucradas.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
 # ─── PAGINA 6: FACTORES DE RIESGO ────────────────────────────
 elif pagina == "Factores de Riesgo":
     st.title("⚠️ Factores de Riesgo")
     st.markdown("---")
 
+    mostrar_metricas(df_filtrado)
+
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Condicion Climatica")
-        clima_counts = df['CONDICION_CLIMATICA'].value_counts().head(8)
+        clima_counts = df_filtrado['CONDICION_CLIMATICA'].value_counts().head(8)
         fig = px.bar(clima_counts, x=clima_counts.index, y=clima_counts.values,
                      color=clima_counts.values, color_continuous_scale='Blues',
                      title='Siniestros por Condicion Climatica')
@@ -424,7 +672,7 @@ elif pagina == "Factores de Riesgo":
 
     with col2:
         st.subheader("Clase de Siniestro")
-        clase_counts = df['CLASE_SINIESTRO'].value_counts()
+        clase_counts = df_filtrado['CLASE_SINIESTRO'].value_counts()
         fig = px.bar(clase_counts, x=clase_counts.index, y=clase_counts.values,
                      color=clase_counts.values, color_continuous_scale='Purples',
                      title='Distribucion por Clase')
@@ -434,7 +682,7 @@ elif pagina == "Factores de Riesgo":
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Tipo de Via")
-        via_counts = df['TIPO_VIA'].value_counts().head(8)
+        via_counts = df_filtrado['TIPO_VIA'].value_counts().head(8)
         fig = px.bar(via_counts, x=via_counts.index, y=via_counts.values,
                      color=via_counts.values, color_continuous_scale='Greens',
                      title='Siniestros por Tipo de Via')
@@ -442,8 +690,8 @@ elif pagina == "Factores de Riesgo":
 
     with col2:
         st.subheader("Riesgo de Infraestructura")
-        if 'RIESGO_INFRAESTRUCTURA' in df.columns:
-            fig = px.histogram(df, x='RIESGO_INFRAESTRUCTURA',
+        if 'RIESGO_INFRAESTRUCTURA' in df_filtrado.columns:
+            fig = px.histogram(df_filtrado, x='RIESGO_INFRAESTRUCTURA',
                                color='SEVERIDAD_LABEL', nbins=10,
                                title='Riesgo de Infraestructura vs Severidad',
                                color_discrete_map={
@@ -458,7 +706,408 @@ elif pagina == "Factores de Riesgo":
     if img_path.exists():
         st.image(str(img_path), use_container_width=True)
 
-# ─── PAGINA 7: MODELOS PREDICTIVOS ───────────────────────────
+    # --- Seccion R: Validacion estadistica ---
+    st.markdown("---")
+    st.subheader("📊 Validacion Estadistica (Resultados de R)")
+    if df_r is not None:
+        st.markdown("""
+        A continuacion se muestran los resultados de las **pruebas de hipotesis**
+        realizadas en **R** para validar estadisticamente la relacion entre los
+        factores de riesgo y la severidad de los siniestros.
+        """)
+        for _, row in df_r.iterrows():
+            p_val = row['p_valor']
+            sig = "✅ Significativo" if p_val < 0.05 else "❌ No significativo"
+            st.markdown(f"""
+            **{row['Prueba']}**: {row['Variable_Independiente']} vs {row['Variable_Dependiente']}
+            - Estadistico: {row['Estadistico']:.4f}
+            - p-valor: {p_val:.6e}
+            - {sig} (α=0.05)
+            - {row['Conclusion']}
+            """)
+    else:
+        st.info("Ejecute el script de R para ver los resultados estadisticos.")
+
+    # Descarga
+    csv_riesgo = df_filtrado.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        "📥 Descargar datos de factores de riesgo (CSV)",
+        data=csv_riesgo,
+        file_name="factores_riesgo_filtrados.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+# ─── PAGINA 7: ANALISIS ESTADISTICO (R) ──────────────────────
+elif pagina == "Analisis Estadistico (R)":
+    st.title("📊 Analisis Estadistico con R")
+    st.markdown("---")
+
+    st.markdown("""
+    Esta pagina muestra los resultados generados por **R** para el analisis
+    estadistico descriptivo e inferencial del proyecto. R se encarga de la
+    validacion estadistica que complementa el Machine Learning desarrollado en Python.
+    """)
+
+    # ─── Seccion 1: Estadistica Descriptiva ────
+    st.subheader("1. Estadistica Descriptiva")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if df_r_sev is not None:
+            st.markdown("**Distribucion de Severidad (desde R):**")
+            fig = px.pie(df_r_sev, values='Conteo', names='Nivel',
+                         title='Distribucion de Severidad',
+                         color='Nivel',
+                         color_discrete_map={
+                             'Baja': '#2ecc71', 'Media': '#f39c12', 'Alta': '#e74c3c'
+                         })
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Ejecute el script de R para visualizar.")
+
+    with col2:
+        st.markdown("**Resumen de Datos:**")
+        st.markdown(f"""
+        - Total de siniestros analizados: **{len(df):,}**
+        - Periodo: **2021-2025**
+        - Departamentos: **24**
+        - Variables analizadas: **{len(df.columns)}**
+        """)
+        if df_r_sev is not None:
+            for _, row in df_r_sev.iterrows():
+                st.markdown(f"- {row['Nivel']}: **{row['Conteo']:,}** ({row['Porcentaje']:.1f}%)")
+
+    # ─── Seccion 2: Graficos R ────
+    st.subheader("2. Visualizaciones Generadas en R")
+    r_figures = [
+        ("r_boxplot_lesionados.png", "Distribucion de Lesionados por Severidad"),
+        ("r_severidad_departamento.png", "Proporcion de Severidad por Departamento"),
+        ("r_correlaciones.png", "Matriz de Correlaciones"),
+        ("r_histograma_edad.png", "Distribucion de Edad Promedio"),
+        ("r_riesgo_infraestructura.png", "Riesgo de Infraestructura por Severidad"),
+    ]
+    cols_r = st.columns(2)
+    for i, (fname, caption) in enumerate(r_figures):
+        fpath = FIGURES / fname
+        with cols_r[i % 2]:
+            if fpath.exists():
+                st.image(str(fpath), caption=caption, use_container_width=True)
+            else:
+                st.info(f"Grafico '{fname}' no disponible. Ejecute el script de R.")
+
+    # ─── Seccion 3: Pruebas de Hipotesis ────
+    st.subheader("3. Pruebas de Hipotesis (Estadistica Inferencial)")
+
+    st.markdown("""
+    Se realizaron **6 pruebas estadisticas** en R para validar la relacion entre
+    los factores de riesgo y la severidad de los siniestros.
+    """)
+
+    if df_r is not None and len(df_r) > 0:
+        for i, (_, row) in enumerate(df_r.iterrows()):
+            p_val = row['p_valor']
+            sig_symbol = "✅" if p_val < 0.05 else "❌"
+            sig_text = "**Significativo**" if p_val < 0.05 else "No significativo"
+
+            with st.expander(f"{sig_symbol} {row['Prueba']}: {row['Variable_Independiente']} vs {row['Variable_Dependiente']}", expanded=i < 3):
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown(f"""
+                    **Tipo de prueba:** {row['Prueba']}\n\n
+                    **Hipotesis Nula (H₀):** No existe relacion entre {row['Variable_Independiente']} y {row['Variable_Dependiente']}\n\n
+                    **Hipotesis Alterna (H₁):** Existe relacion entre {row['Variable_Independiente']} y {row['Variable_Dependiente']}
+                    """)
+                with col_b:
+                    st.markdown(f"""
+                    **Estadistico de prueba:** {row['Estadistico']:.4f}\n\n
+                    **p-valor:** {p_val:.6e}\n\n
+                    **Nivel de significancia:** α = 0.05\n\n
+                    **Conclusion:** {sig_text} — {row['Conclusion']}
+                    """)
+
+        st.success(f"""
+        Todas las **{len(df_r)} pruebas estadisticas** resultaron **significativas** (p < 0.05),
+        lo que confirma que los factores analizados tienen una relacion estadisticamente
+        significativa con la severidad de los siniestros viales.
+        """)
+    else:
+        st.warning("No se encontraron resultados de R. Ejecute primero el script R:")
+        st.code('"D:/R-4.6.1/bin/x64/Rscript.exe" r/estadistica/analisis_descriptivo.R')
+
+    # ─── Seccion 4: Reporte Completo ────
+    st.subheader("4. Reporte Estadistico Completo")
+    report_path = REPORTS / "reporte_estadistico_R.txt"
+    if report_path.exists():
+        with open(report_path, "r", encoding="utf-8") as f:
+            report_content = f.read()
+        with st.expander("Ver reporte completo generado por R"):
+            st.text(report_content)
+        st.download_button(
+            "📥 Descargar Reporte Estadistico (TXT)",
+            data=report_content,
+            file_name="reporte_estadistico_R.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
+    else:
+        st.info("Reporte no disponible. Ejecute el script de R primero.")
+
+    # ─── Seccion 5: Metodologia ────
+    st.subheader("5. Justificacion del Uso de R")
+    st.markdown("""
+    | Aspecto | Python | R |
+    |---------|--------|---|
+    | **Proposito** | Ingenieria de datos, ML, Dashboard | Estadistica descriptiva e inferencial |
+    | **Librerias** | pandas, scikit-learn, xgboost | tidyverse, ggplot2, corrplot, caret |
+    | **Analisis** | Modelado predictivo, SHAP | Pruebas chi-cuadrado, ANOVA, Tukey HSD |
+    | **Visualizaciones** | Plotly interactivo (Dashboard) | ggplot2 profesional (figuras PNG) |
+    | **Output** | Modelos .pkl, Dashboard | Graficos PNG, reporte .txt, tablas .csv |
+
+    **R** se utilizó exclusivamente para el **analisis estadistico formal** (pruebas de hipotesis,
+    ANOVA, diagnosticos), mientras que **Python** se encargó del preprocesamiento,
+    modelado, y dashboard interactivo. Ambos lenguajes se **complementan** y sus resultados
+    se integran en esta interfaz.
+    """)
+
+# ─── PAGINA 8: DASHBOARD EJECUTIVO ────────────────────────────
+elif pagina == "Dashboard Ejecutivo":
+    st.title("🏛️ Dashboard Ejecutivo - ONSV")
+    st.markdown("---")
+
+    # ─── Seccion 1: KPIS ESTRATEGICOS ────
+    st.subheader("Indicadores Estrategicos Nacionales")
+
+    # KPI globales (sin filtros, datos nacionales)
+    total_siniestros = len(df)
+    total_fallecidos = int(df['CANTIDAD_FALLECIDOS'].sum())
+    total_lesionados = int(df['CANTIDAD_LESIONADOS'].sum())
+    tasa_mortalidad = total_fallecidos / total_siniestros if total_siniestros > 0 else 0
+    pct_alta_nac = (df['severidad'] == 2).sum() / total_siniestros * 100
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#1a5276,#2980b9);padding:15px;border-radius:10px;text-align:center;">
+            <p style="color:#85c1e9;font-size:11px;margin:0;">🚦 TOTAL SINIESTROS</p>
+            <p style="color:white;font-size:26px;font-weight:bold;margin:5px 0;">{total_siniestros:,}</p>
+        </div>""", unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#922b21,#e74c3c);padding:15px;border-radius:10px;text-align:center;">
+            <p style="color:#f1948a;font-size:11px;margin:0;">💀 TOTAL FALLECIDOS</p>
+            <p style="color:white;font-size:26px;font-weight:bold;margin:5px 0;">{total_fallecidos:,}</p>
+        </div>""", unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#1e8449,#27ae60);padding:15px;border-radius:10px;text-align:center;">
+            <p style="color:#82e0aa;font-size:11px;margin:0;">🏥 TOTAL LESIONADOS</p>
+            <p style="color:white;font-size:26px;font-weight:bold;margin:5px 0;">{total_lesionados:,}</p>
+        </div>""", unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#7d3c98,#af7ac5);padding:15px;border-radius:10px;text-align:center;">
+            <p style="color:#d2b4de;font-size:11px;margin:0;">📊 TASA MORTALIDAD</p>
+            <p style="color:white;font-size:26px;font-weight:bold;margin:5px 0;">{tasa_mortalidad:.2f}</p>
+        </div>""", unsafe_allow_html=True)
+    with col5:
+        color_alta = "#e74c3c" if pct_alta_nac > 5 else ("#f39c12" if pct_alta_nac > 3 else "#2ecc71")
+        st.markdown(f"""<div style="background:linear-gradient(135deg,#b7950b,#f1c40f);padding:15px;border-radius:10px;text-align:center;">
+            <p style="color:#333;font-size:11px;margin:0;">⚠️ SEVERIDAD ALTA</p>
+            <p style="color:white;font-size:26px;font-weight:bold;margin:5px 0;">{pct_alta_nac:.1f}%</p>
+        </div>""", unsafe_allow_html=True)
+
+    # ─── Seccion 2: MAPA COROPLETICO ────
+    st.markdown("---")
+    st.subheader("🗺️ Mapa de Riesgo por Departamento")
+
+    # Agregar datos por departamento
+    dpto_data = df.groupby('DEPARTAMENTO').agg(
+        Siniestros=('CODIGO_SINIESTRO', 'count'),
+        Fallecidos=('CANTIDAD_FALLECIDOS', 'sum'),
+        Lesionados=('CANTIDAD_LESIONADOS', 'sum'),
+        Severidad_Prom=('severidad', 'mean'),
+        Tasa_Mortalidad=('CANTIDAD_FALLECIDOS', 'mean'),
+        Pct_Rural=('ZONA', lambda x: (x == 'RURAL').mean() * 100)
+    ).reset_index()
+
+    dpto_data['Severidad_Prom_Redondeada'] = dpto_data['Severidad_Prom'].round(2)
+    dpto_data['label'] = dpto_data['DEPARTAMENTO'] + '<br>' + \
+                         dpto_data['Siniestros'].astype(str) + ' siniestros | ' + \
+                         'Sev: ' + dpto_data['Severidad_Prom_Redondeada'].astype(str)
+
+    # Normalizar nombres de departamentos para coincidir con GeoJSON
+    def norm_dpto(nombre):
+        """Normalizar nombre de departamento para coincidir con GeoJSON."""
+        nombre = nombre.upper().strip()
+        # Mapa de correcciones
+        correcciones = {
+            'LIMA': 'LIMA', 'CALLAO': 'CALLAO', 'AREQUIPA': 'AREQUIPA',
+            'CUSCO': 'CUSCO', 'LA LIBERTAD': 'LA LIBERTAD', 'PUNO': 'PUNO',
+            'JUNIN': 'JUNIN', 'CAJAMARCA': 'CAJAMARCA', 'ANCASH': 'ANCASH',
+            'PIURA': 'PIURA', 'ICA': 'ICA', 'LAMBAYEQUE': 'LAMBAYEQUE',
+            'HUANUCO': 'HUANUCO', 'SAN MARTIN': 'SAN MARTIN',
+            'AYACUCHO': 'AYACUCHO', 'LORETO': 'LORETO', 'HUANCAVELICA': 'HUANCAVELICA',
+            'APURIMAC': 'APURIMAC', 'PASCO': 'PASCO', 'TACNA': 'TACNA',
+            'TUMBES': 'TUMBES', 'MOQUEGUA': 'MOQUEGUA', 'AMAZONAS': 'AMAZONAS',
+            'UCAYALI': 'UCAYALI', 'MADRE DE DIOS': 'MADRE DE DIOS',
+            'LIMA PROVINCIAS': 'LIMA', 'LIMA METROPOLITANA': 'LIMA',
+        }
+        return correcciones.get(nombre, nombre)
+
+    dpto_data['DPTO_NORM'] = dpto_data['DEPARTAMENTO'].apply(norm_dpto)
+
+    # Mostrar mapa coropletico
+    col_map1, col_map2 = st.columns([3, 1])
+
+    with col_map1:
+        if geojson_peru is not None:
+            # Mapa de Siniestros
+            fig_choropleth = px.choropleth(
+                dpto_data,
+                geojson=geojson_peru,
+                locations='DPTO_NORM',
+                color='Siniestros',
+                featureidkey='properties.NOMBDEP',
+                color_continuous_scale='YlOrRd',
+                range_color=(0, dpto_data['Siniestros'].max()),
+                title='Siniestros por Departamento',
+                labels={'Siniestros': 'Cantidad'},
+                hover_data={'DPTO_NORM': False, 'Siniestros': True,
+                           'Fallecidos': True, 'Severidad_Prom': True,
+                           'Tasa_Mortalidad': ':,.2f'}
+            )
+            fig_choropleth.update_geos(fitbounds='locations', visible=False)
+            fig_choropleth.update_layout(
+                height=500,
+                margin=dict(l=0, r=0, t=30, b=0),
+                coloraxis_colorbar=dict(
+                    title="Siniestros",
+                    orientation="h",
+                    y=-0.15,
+                    len=0.5
+                )
+            )
+            st.plotly_chart(fig_choropleth, use_container_width=True)
+        else:
+            st.warning("No se pudo cargar el mapa. Verifique el archivo GeoJSON.")
+
+    with col_map2:
+        st.markdown("**Leyenda de Riesgo**")
+        max_s = dpto_data['Siniestros'].max()
+        for _, row in dpto_data.sort_values('Siniestros', ascending=False).head(8).iterrows():
+            nivel = '🔴' if row['Severidad_Prom'] > 0.6 else ('🟡' if row['Severidad_Prom'] > 0.3 else '🟢')
+            st.markdown(f"{nivel} **{row['DEPARTAMENTO']}**: {row['Siniestros']:,} ({row['Severidad_Prom']:.2f})")
+
+    # ─── Seccion 3: ALERTAS Y RANKING ────
+    st.markdown("---")
+    st.subheader("🚨 Alertas y Recomendaciones")
+
+    # Sistema de alertas
+    alertas = []
+    for _, row in dpto_data.sort_values('Siniestros', ascending=False).head(5).iterrows():
+        if row['Siniestros'] > 500:
+            nivel_alerta = "🔴 CRITICO"
+        elif row['Siniestros'] > 200:
+            nivel_alerta = "🟡 ATENCION"
+        else:
+            nivel_alerta = "🟢 MONITOREO"
+        alertas.append((nivel_alerta, row['DEPARTAMENTO'], row['Siniestros'], row['Severidad_Prom']))
+
+    col_a1, col_a2 = st.columns(2)
+    with col_a1:
+        st.markdown("**Alertas por Departamento**")
+        for nivel, dpto, total, sev in alertas:
+            st.markdown(f"{nivel} **{dpto}** — {total:,} siniestros (severidad: {sev:.2f})")
+    with col_a2:
+        # Peligros nacionales
+        pct_rural_nac = (df['ZONA'] == 'RURAL').mean() * 100
+        top_causa = df['CAUSA_FACTOR_PRINCIPAL'].value_counts().index[0]
+        franja_peligrosa = df['FRANJA_HORARIA'].mode()[0]
+        franja_nombres = {0: 'Madrugada', 1: 'Maniana', 2: 'Tarde', 3: 'Noche'}
+        st.markdown("**Alertas Nacionales**")
+        st.markdown(f"⚠️ El **{pct_rural_nac:.0f}%** de siniestros ocurre en zona rural")
+        st.markdown(f"⚠️ Causa principal: **{top_causa}**")
+        st.markdown(f"⚠️ Franja mas peligrosa: **{franja_nombres.get(franja_peligrosa, '-')}**")
+
+        # Descarga datos de departamentos
+        csv_dpto = dpto_data.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            "📥 Descargar datos departamentales (CSV)",
+            data=csv_dpto,
+            file_name="datos_departamentos.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+    # ─── Seccion 4: TABLA DE RANKING ────
+    st.markdown("---")
+    st.subheader("📋 Ranking de Departamentos por Riesgo")
+
+    # Calcular indicador compuesto de riesgo
+    dpto_data['Indice_Riesgo'] = (
+        dpto_data['Severidad_Prom'] * 0.4 +
+        (dpto_data['Tasa_Mortalidad'] / dpto_data['Tasa_Mortalidad'].max()) * 0.3 +
+        (dpto_data['Pct_Rural'] / 100) * 0.3
+    ).round(3)
+
+    ranking = dpto_data.sort_values('Indice_Riesgo', ascending=False).reset_index(drop=True)
+    ranking['Posicion'] = range(1, len(ranking) + 1)
+    ranking['Alerta'] = ranking['Indice_Riesgo'].apply(
+        lambda x: '🔴' if x > 0.5 else ('🟡' if x > 0.3 else '🟢')
+    )
+
+    ranking_show = ranking[['Posicion', 'Alerta', 'DEPARTAMENTO', 'Siniestros',
+                            'Fallecidos', 'Severidad_Prom', 'Tasa_Mortalidad',
+                            'Pct_Rural', 'Indice_Riesgo']].rename(columns={
+        'DEPARTAMENTO': 'Departamento',
+        'Siniestros': 'Siniestros',
+        'Fallecidos': 'Fallecidos',
+        'Severidad_Prom': 'Severidad Prom',
+        'Tasa_Mortalidad': 'Tasa Mortalidad',
+        'Pct_Rural': '% Rural',
+        'Indice_Riesgo': 'Indice Riesgo'
+    })
+
+    st.dataframe(
+        ranking_show.style.format({
+            'Severidad Prom': '{:.2f}',
+            'Tasa Mortalidad': '{:.2f}',
+            'Pct_Rural': '{:.1f}%',
+            'Indice Riesgo': '{:.3f}',
+            'Siniestros': '{:,.0f}',
+            'Fallecidos': '{:,.0f}'
+        }).applymap(
+            lambda x: 'background-color: #ffcccc' if isinstance(x, float) and x > 0.5 else
+                      ('background-color: #fff3cd' if isinstance(x, float) and x > 0.3 else ''),
+            subset=['Indice Riesgo']
+        ),
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # Descarga
+    csv_ranking = ranking_show.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        "📥 Descargar Ranking Completo (CSV)",
+        data=csv_ranking,
+        file_name="ranking_riesgo_departamentos.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # ─── Seccion 5: CONCLUSIONES EJECUTIVAS ────
+    st.markdown("---")
+    st.subheader("📌 Resumen Ejecutivo")
+
+    mejor_dpto = ranking.iloc[-1]['DEPARTAMENTO']
+    peor_dpto = ranking.iloc[0]['DEPARTAMENTO']
+
+    st.markdown(f"""
+    - **Departamento mas critico:** {peor_dpto} (Indice de Riesgo: {ranking.iloc[0]['Indice_Riesgo']:.3f})
+    - **Departamento menos critico:** {mejor_dpto} (Indice de Riesgo: {ranking.iloc[-1]['Indice_Riesgo']:.3f})
+    - **Promedio nacional de severidad:** {dpto_data['Severidad_Prom'].mean():.2f}
+    - **Total nacional de siniestros:** {total_siniestros:,}
+    - **Recomendacion prioritaria:** Reforzar presencia policial y controles en {peor_dpto}
+    """)
+
+# ─── PAGINA 9: MODELOS PREDICTIVOS ───────────────────────────
 elif pagina == "Modelos Predictivos":
     st.title("🤖 Modelos Predictivos")
     st.markdown("---")
@@ -491,7 +1140,7 @@ elif pagina == "Modelos Predictivos":
     else:
         st.warning("Resultados de modelos no encontrados. Ejecute primero 04_modelamiento.py")
 
-# ─── PAGINA 8: PREDICCION INDIVIDUAL ──────────────────────────
+# ─── PAGINA 9: PREDICCION INDIVIDUAL ──────────────────────────
 elif pagina == "Prediccion Individual":
     st.title("🔮 Prediccion Individual de Severidad")
     st.markdown("---")
@@ -587,12 +1236,98 @@ elif pagina == "Prediccion Individual":
 
                 st.success(f"**Prediccion:** {severidad_map[pred]} con {proba[pred]*100:.1f}% de probabilidad")
 
+                # Analisis de contribucion de variables
+                st.markdown("---")
+                st.subheader("📊 Analisis de Contribucion de Variables")
+
+                # Obtener coeficientes del modelo
+                coef = model.coef_[pred]  # Coeficientes para la clase predicha
+                contribuciones = pd.DataFrame({
+                    'Variable': list(scaler.feature_names_in_),
+                    'Contribucion': coef * input_scaled[0]
+                }).sort_values('Contribucion', ascending=False)
+
+                fig_contrib = px.bar(
+                    contribuciones.head(10),
+                    x='Contribucion', y='Variable',
+                    orientation='h',
+                    color='Contribucion',
+                    color_continuous_scale='RdYlGn',
+                    title='Top 10 Variables que mas influyeron en la prediccion'
+                )
+                fig_contrib.update_layout(height=400)
+                st.plotly_chart(fig_contrib, use_container_width=True)
+
+                st.markdown("""
+                **Interpretacion:** Las barras en verde aumentan la probabilidad de
+                severidad **alta**, mientras que las barras en rojo indican factores
+                que **reducen** el riesgo (asociados a severidad baja).
+                """)
+
+                # Comparacion con casos similares
+                st.markdown("---")
+                st.subheader("🔄 Casos Historicos Similares")
+
+                try:
+                    # Buscar casos similares en el dataset
+                    distancias = np.linalg.norm(
+                        scaler.transform(df[list(scaler.feature_names_in_)].fillna(0).values) -
+                        input_scaled,
+                        axis=1
+                    )
+                    casos_similares = df.iloc[distancias.argsort()[:5]]
+
+                    st.markdown("**Los 5 siniestros mas similares en el historial:**")
+                    similar_show = casos_similares[[
+                        'DEPARTAMENTO', 'CLASE_SINIESTRO', 'SEVERIDAD_LABEL',
+                        'CANTIDAD_FALLECIDOS', 'CANTIDAD_LESIONADOS',
+                        'ZONA', 'CONDICION_CLIMATICA'
+                    ]].copy()
+                    st.dataframe(similar_show, use_container_width=True)
+
+                    # Distribucion de severidad en casos similares
+                    sev_counts = casos_similares['SEVERIDAD_LABEL'].value_counts()
+                    fig_sev = px.pie(
+                        values=sev_counts.values,
+                        names=sev_counts.index,
+                        title='Distribucion de severidad en casos similares',
+                        color=sev_counts.index,
+                        color_discrete_map={
+                            'Baja (1 fallecido)': '#2ecc71',
+                            'Media (2 fallecidos)': '#f39c12',
+                            'Alta (3+ fallecidos)': '#e74c3c'
+                        }
+                    )
+                    st.plotly_chart(fig_sev, use_container_width=True)
+                except:
+                    st.info("No se pudieron calcular casos similares.")
+
+                # Exportar prediccion
+                result_row = {
+                    'Prediccion': severidad_map[pred],
+                    'Prob_Baja': round(proba[0]*100, 1),
+                    'Prob_Media': round(proba[1]*100, 1),
+                    'Prob_Alta': round(proba[2]*100, 1),
+                    'Hora': hora, 'Mes': mes, 'Anio': anio,
+                    'Zona': zona, 'Clima': clima,
+                    'Lesionados': lesionados, 'Vehiculos': vehiculos
+                }
+                csv_pred = pd.DataFrame([result_row]).to_csv(index=False).encode('utf-8-sig')
+                st.download_button(
+                    "📥 Descargar resultado de prediccion (CSV)",
+                    data=csv_pred,
+                    file_name="prediccion_severidad.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
             except Exception as e:
                 st.error(f"Error en la prediccion: {e}")
+                st.info("Verifique que todos los campos esten correctamente llenados.")
     else:
         st.warning("Modelo no disponible. Ejecute primero 04_modelamiento.py")
 
-# ─── PAGINA 9: CONCLUSIONES ──────────────────────────────────
+# ─── PAGINA 10: CONCLUSIONES ─────────────────────────────────
 elif pagina == "Conclusiones":
     st.title("📝 Conclusiones y Recomendaciones")
     st.markdown("---")
